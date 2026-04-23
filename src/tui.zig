@@ -19,6 +19,7 @@ const Theme = struct {
 };
 
 const themes = [_]Theme{
+    .{ .name = "amp", .header = 255, .accent = 43, .user = 250, .agent = 255, .note = 245 },
     .{ .name = "oxide", .header = 39, .accent = 44, .user = 214, .agent = 81, .note = 244 },
     .{ .name = "ember", .header = 202, .accent = 208, .user = 220, .agent = 79, .note = 244 },
     .{ .name = "lagoon", .header = 45, .accent = 51, .user = 215, .agent = 86, .note = 244 },
@@ -274,6 +275,7 @@ const App = struct {
     scroll_from_bottom: usize = 0,
     theme_index: usize = 0,
     spinner: usize = 0,
+    location_label: ?[]u8 = null,
     messages: ArrayList(Message) = .empty,
     context: ArrayList(ContextItem) = .empty,
     queue: ArrayList(Job) = .empty,
@@ -293,6 +295,8 @@ const App = struct {
             .size = try readTerminalSize(),
             .worker_queue = .{ .io = io },
         };
+        app.location_label = try buildLocationLabel(gpa, io, environ_map);
+        errdefer if (app.location_label) |label| gpa.free(label);
         if (opts.initial_prompt) |prompt| {
             try app.draft.appendSlice(gpa, prompt);
             app.cursor = app.draft.items.len;
@@ -316,6 +320,7 @@ const App = struct {
         self.render_buf.deinit(self.gpa);
         if (self.search) |*search| search.deinit(self.gpa);
         if (self.history_draft) |draft| self.gpa.free(draft);
+        if (self.location_label) |label| self.gpa.free(label);
         for (self.history.items) |entry| self.gpa.free(entry);
         self.history.deinit(self.gpa);
     }
@@ -934,12 +939,7 @@ const App = struct {
         const arg = if (split) |i| std.mem.trim(u8, body[i + 1 ..], " \t\r\n") else "";
 
         if (std.ascii.eqlIgnoreCase(name, "help")) {
-            try self.appendNote(
-                "Commands: /help /clear /remix /theme [oxide|ember|lagoon|next]\n" ++
-                    "Controls: Enter sends, Ctrl-J inserts a newline, and Tab queues while a reply is active.\n" ++
-                    "Busy state: Enter schedules the next prompt ahead of queued turns.\n" ++
-                    "Navigation: Up/Down move through the draft and fall back to history at the edges. Ctrl-R searches history. Ctrl-C quits.",
-            );
+            try self.showHelpNote();
             return .handled;
         }
         if (std.ascii.eqlIgnoreCase(name, "clear")) {
@@ -984,10 +984,30 @@ const App = struct {
         return .rejected;
     }
 
+    fn showHelpNote(self: *App) !void {
+        try self.appendNote(
+            "Shortcuts\n" ++
+                "Enter sends. Ctrl-J inserts a newline. Tab queues behind an active reply.\n" ++
+                "Up/Down move through wrapped draft lines and fall back to history at the edges. Ctrl-P and Ctrl-N walk history directly.\n" ++
+                "Ctrl-R searches history. Ctrl-C quits.\n\n" ++
+                "Commands\n" ++
+                "/help /clear /remix /theme [amp|oxide|ember|lagoon|next]",
+        );
+    }
+
     fn submitDraft(self: *App, requested_queue: bool) !void {
         const trimmed = std.mem.trim(u8, self.draft.items, " \n\r\t");
         if (trimmed.len == 0) {
             try self.setNotice("draft is empty", .{});
+            return;
+        }
+
+        if (std.mem.eql(u8, trimmed, "?")) {
+            try self.recordHistory(trimmed);
+            try self.showHelpNote();
+            self.draft.clearRetainingCapacity();
+            self.cursor = 0;
+            self.resetHistoryNavigation();
             return;
         }
 
@@ -1041,7 +1061,7 @@ const App = struct {
         }
 
         try self.startRequest(job);
-        try self.setNotice("streaming reply", .{});
+        self.clearNotice();
     }
 
     fn remixLastPrompt(self: *App, requested_queue: bool) !void {
@@ -1126,9 +1146,9 @@ const App = struct {
             if (self.queue.items.len != 0) {
                 const next = self.queue.orderedRemove(0);
                 try self.startRequest(next);
-                try self.setNotice("streaming reply", .{});
+                self.clearNotice();
             } else if (terminal == .completed) {
-                try self.setNotice("ready", .{});
+                self.clearNotice();
             }
         }
 
@@ -1199,26 +1219,34 @@ const App = struct {
         try self.notice.print(self.gpa, fmt, args);
     }
 
+    fn clearNotice(self: *App) void {
+        self.notice.clearRetainingCapacity();
+    }
+
     fn render(self: *App) !void {
         self.render_buf.clearRetainingCapacity();
 
-        if (self.size.cols < 32 or self.size.rows < 12) {
+        if (self.size.cols < 48 or self.size.rows < 14) {
             try self.renderTooSmall();
             return;
         }
 
         const theme = themes[self.theme_index];
-        const transcript_width = self.size.cols - 3;
-        const compose_width = self.size.cols - 3;
+        const box_margin: usize = 1;
+        const transcript_margin: usize = 3;
+        const box_outer_width = self.size.cols -| (box_margin * 2);
+        const compose_width = maxUsize(box_outer_width -| 4, 1);
+        const transcript_width = maxUsize(self.size.cols -| (transcript_margin * 2 + 2), 1);
 
         var draft_lines = try wrapLines(self.gpa, self.draft.items, compose_width);
         defer draft_lines.deinit(self.gpa);
         const draft_cursor = cursorVisual(draft_lines.items, self.cursor);
 
-        const reserved_rows: usize = 2 + 1 + 1;
-        const available_compose_rows = maxUsize(self.size.rows -| reserved_rows, 1);
-        const compose_height = minUsize(maxUsize(draft_lines.items.len, 1), available_compose_rows);
-        const transcript_height = available_compose_rows -| compose_height;
+        const info_height: usize = 1;
+        const max_compose_height = maxUsize(self.size.rows -| (info_height + 2), 1);
+        const compose_height = minUsize(maxUsize(draft_lines.items.len, 1), max_compose_height);
+        const compose_outer_height = compose_height + 2;
+        const transcript_height = self.size.rows -| (compose_outer_height + info_height);
 
         var transcript_lines = try self.buildTranscriptLines(transcript_width);
         defer transcript_lines.deinit(self.gpa);
@@ -1231,6 +1259,8 @@ const App = struct {
 
         const transcript_end = transcript_lines.items.len - self.scroll_from_bottom;
         const transcript_start = transcript_end -| transcript_height;
+        const transcript_visible = transcript_end - transcript_start;
+        const transcript_padding = transcript_height - transcript_visible;
 
         const compose_view_end = maxUsize(draft_cursor.line + 1, compose_height);
         const compose_visible_end = minUsize(compose_view_end, draft_lines.items.len);
@@ -1238,53 +1268,64 @@ const App = struct {
 
         try self.render_buf.appendSlice(self.gpa, "\x1b[?25l\x1b[H");
         var screen_row: usize = 1;
-        try self.renderHeader(theme);
-        screen_row += 2;
 
-        var line_index = transcript_start;
-        while (line_index < transcript_end) : (line_index += 1) {
-            try self.renderTranscriptLine(theme, transcript_lines.items[line_index], transcript_width);
-            screen_row += 1;
+        if (self.messages.items.len == 0) {
+            try self.renderEmptySplash(theme, transcript_height);
+            screen_row += transcript_height;
+        } else {
+            var padding = transcript_padding;
+            while (padding > 0) : (padding -= 1) {
+                try self.newLine();
+                screen_row += 1;
+            }
+
+            var line_index = transcript_start;
+            while (line_index < transcript_end) : (line_index += 1) {
+                try self.renderTranscriptLine(theme, transcript_lines.items[line_index], transcript_margin, transcript_width);
+                screen_row += 1;
+            }
         }
 
-        var padding = transcript_height - (transcript_end - transcript_start);
-        while (padding > 0) : (padding -= 1) {
-            try self.newLine();
-            screen_row += 1;
-        }
-
-        try self.renderRule(theme, "compose", self.size.cols);
+        var top_label_buf: [128]u8 = undefined;
+        const top_label = if (self.active_request != null)
+            try std.fmt.bufPrint(&top_label_buf, "{s} streaming {c}", .{ openai.DEFAULT_MODEL, spinnerChar(self.spinner) })
+        else if (self.queue.items.len != 0)
+            try std.fmt.bufPrint(&top_label_buf, "{s} {d} queued", .{ openai.DEFAULT_MODEL, self.queue.items.len })
+        else
+            openai.DEFAULT_MODEL;
+        try self.renderPanelBorder(theme, box_margin, box_outer_width, "╭", "╮", top_label, theme.accent);
         screen_row += 1;
         const compose_start_row = screen_row;
 
         var compose_row = compose_visible_start;
         while (compose_row < compose_visible_end) : (compose_row += 1) {
-            const prefix = if (compose_row == 0) "> " else "  ";
             const span = draft_lines.items[compose_row];
-            try self.setColor(theme.accent);
-            try self.render_buf.appendSlice(self.gpa, prefix);
-            try self.resetColor();
-            if (span.end > span.start) {
-                try self.appendClipped(self.draft.items[span.start..span.end], compose_width);
-            }
-            try self.newLine();
+            try self.renderPanelRow(theme, box_margin, compose_width, self.draft.items[span.start..span.end]);
             screen_row += 1;
         }
 
-        padding = compose_height - (compose_visible_end - compose_visible_start);
+        var padding = compose_height - (compose_visible_end - compose_visible_start);
         while (padding > 0) : (padding -= 1) {
-            try self.setColor(theme.accent);
-            try self.render_buf.appendSlice(self.gpa, "  ");
-            try self.resetColor();
-            try self.newLine();
+            try self.renderPanelRow(theme, box_margin, compose_width, "");
             screen_row += 1;
         }
 
-        try self.renderFooter(theme);
+        try self.renderPanelBorder(
+            theme,
+            box_margin,
+            box_outer_width,
+            "╰",
+            "╯",
+            self.location_label orelse "",
+            theme.note,
+        );
+        screen_row += 1;
+
+        try self.renderInfoRow(theme);
 
         const visible_cursor_line = draft_cursor.line -| compose_visible_start;
         const cursor_row = compose_start_row + visible_cursor_line;
-        const cursor_col = 3 + draft_cursor.col;
+        const cursor_col = box_margin + 3 + draft_cursor.col;
         try self.render_buf.print(self.gpa, "\x1b[{d};{d}H\x1b[?25h", .{ cursor_row, cursor_col });
 
         try File.writeStreamingAll(self.stdout, self.io, self.render_buf.items);
@@ -1293,49 +1334,115 @@ const App = struct {
     fn renderTooSmall(self: *App) !void {
         self.render_buf.clearRetainingCapacity();
         try self.render_buf.appendSlice(self.gpa, "\x1b[?25l\x1b[H");
-        try self.render_buf.appendSlice(self.gpa, "agentz tui prototype\r\n");
-        try self.render_buf.appendSlice(self.gpa, "Resize the terminal to at least 32x12.\r\n");
+        try self.render_buf.appendSlice(self.gpa, "agentz\r\n");
+        try self.render_buf.appendSlice(self.gpa, "Resize the terminal to at least 48x14.\r\n");
         try self.render_buf.appendSlice(self.gpa, "\x1b[3;1H\x1b[?25h");
         try File.writeStreamingAll(self.stdout, self.io, self.render_buf.items);
     }
 
-    fn renderHeader(self: *App, theme: Theme) !void {
-        var header: [256]u8 = undefined;
-        const state = if (self.active_request != null) "streaming" else if (self.queue.items.len != 0) "queued" else "idle";
-        const spin = spinnerChar(self.spinner);
-        const line = try std.fmt.bufPrint(
-            &header,
-            "agentz tui proto [{s}] {s} {c} msgs:{d} queue:{d}",
-            .{ theme.name, state, spin, self.messages.items.len, self.queue.items.len },
-        );
-        try self.setColor(theme.header);
-        try self.render_buf.appendSlice(self.gpa, "\x1b[1m");
-        try self.appendClipped(line, self.size.cols);
-        try self.resetColor();
-        try self.newLine();
+    fn renderEmptySplash(self: *App, theme: Theme, height: usize) !void {
+        const art = [_][]const u8{
+            "          .............",
+            "      ....:::::::::::::....",
+            "    ..::::--------------:::..",
+            "   .::---====++++++++====---::.",
+            "  .::--===+++++****+++++===--::.",
+            " .::--==+++***######***+++==--::.",
+            " .:--==++***##########***++==--:.",
+            " .:--==++***##########***++==--:.",
+            " .::--==+++***######***+++==--::.",
+            "  .::--===+++++****+++++===--::.",
+            "   .:::---====++++++====---:::.",
+            "     ..::::------------::::..",
+            "        ...::::::::::::...",
+        };
+        const copy = [_]struct { text: []const u8, color: u8, bold: bool }{
+            .{ .text = "Welcome to Agentz", .color = theme.accent, .bold = true },
+            .{ .text = "", .color = theme.note, .bold = false },
+            .{ .text = "Streaming responses, local context, terminal-first.", .color = theme.header, .bold = false },
+            .{ .text = "", .color = theme.note, .bold = false },
+            .{ .text = "\"Build the loop first. Polish the agent second.\"", .color = theme.note, .bold = false },
+        };
+        const copy_offset: usize = 3;
+        const gap: usize = 5;
 
-        var controls: [256]u8 = undefined;
-        const controls_line = try std.fmt.bufPrint(
-            &controls,
-            "ctrl-c quit",
-            .{},
-        );
-        try self.setColor(theme.note);
-        try self.appendClipped(controls_line, self.size.cols);
-        try self.resetColor();
-        try self.newLine();
+        var art_width: usize = 0;
+        for (art) |line| art_width = maxUsize(art_width, line.len);
+
+        var copy_width: usize = 0;
+        for (copy) |line| copy_width = maxUsize(copy_width, line.text.len);
+
+        const block_height = maxUsize(art.len, copy_offset + copy.len);
+        const block_width = art_width + gap + copy_width;
+        if (height == 0) return;
+
+        if (block_width + 4 > self.size.cols or block_height > height) {
+            const top_padding = (height -| 2) / 2;
+            var row: usize = 0;
+            while (row < top_padding) : (row += 1) try self.newLine();
+            const left_padding = (self.size.cols -| "Welcome to Agentz".len) / 2;
+            try self.appendRepeat(" ", left_padding);
+            try self.setColor(theme.accent);
+            try self.render_buf.appendSlice(self.gpa, "\x1b[1mWelcome to Agentz");
+            try self.resetColor();
+            try self.newLine();
+            const subtitle = "Start typing below.";
+            const subtitle_padding = (self.size.cols -| subtitle.len) / 2;
+            try self.appendRepeat(" ", subtitle_padding);
+            try self.setColor(theme.note);
+            try self.render_buf.appendSlice(self.gpa, subtitle);
+            try self.resetColor();
+            try self.newLine();
+            row += 2;
+            while (row < height) : (row += 1) try self.newLine();
+            return;
+        }
+
+        const top_padding = (height - block_height) / 2;
+        const left_padding = (self.size.cols - block_width) / 2;
+        var row: usize = 0;
+        while (row < top_padding) : (row += 1) try self.newLine();
+
+        while (row < top_padding + block_height) : (row += 1) {
+            const block_row = row - top_padding;
+            try self.appendRepeat(" ", left_padding);
+
+            if (block_row < art.len) {
+                try self.setColor(theme.accent);
+                try self.render_buf.appendSlice(self.gpa, art[block_row]);
+                try self.resetColor();
+                try self.appendRepeat(" ", art_width - art[block_row].len);
+            } else {
+                try self.appendRepeat(" ", art_width);
+            }
+
+            try self.appendRepeat(" ", gap);
+
+            if (block_row >= copy_offset and block_row < copy_offset + copy.len) {
+                const line = copy[block_row - copy_offset];
+                try self.setColor(line.color);
+                if (line.bold) try self.render_buf.appendSlice(self.gpa, "\x1b[1m");
+                try self.render_buf.appendSlice(self.gpa, line.text);
+                try self.resetColor();
+            }
+
+            try self.newLine();
+        }
+
+        while (row < height) : (row += 1) try self.newLine();
     }
 
     fn renderTranscriptLine(
         self: *App,
         theme: Theme,
         line: TranscriptLine,
+        margin: usize,
         width: usize,
     ) !void {
         const prefix = switch (line.role) {
-            .user => if (line.first) "u> " else "   ",
-            .agent => if (line.first and line.active) "a* " else if (line.first) "a> " else "   ",
-            .note => if (line.first) ".. " else "   ",
+            .user => if (line.first) "› " else "  ",
+            .agent => "  ",
+            .note => "  ",
         };
         const color = switch (line.role) {
             .user => theme.user,
@@ -1343,28 +1450,68 @@ const App = struct {
             .note => theme.note,
         };
 
-        try self.setColor(color);
+        try self.appendRepeat(" ", margin);
+        if (line.slice.len == 0) {
+            try self.newLine();
+            return;
+        }
+
+        try self.setColor(theme.note);
         try self.render_buf.appendSlice(self.gpa, prefix);
+        try self.resetColor();
+        try self.setColor(color);
+        if (line.active and line.first) try self.render_buf.appendSlice(self.gpa, "\x1b[1m");
         try self.appendClipped(line.slice, width);
         try self.resetColor();
         try self.newLine();
     }
 
-    fn renderRule(self: *App, theme: Theme, title: []const u8, width: usize) !void {
-        try self.setColor(theme.accent);
-        try self.render_buf.appendSlice(self.gpa, "-- ");
-        try self.render_buf.appendSlice(self.gpa, title);
-        try self.render_buf.appendSlice(self.gpa, " ");
-        const used = 4 + title.len;
-        var dash_count = width -| used;
-        while (dash_count > 0) : (dash_count -= 1) {
-            try self.render_buf.append(self.gpa, '-');
+    fn renderPanelBorder(
+        self: *App,
+        theme: Theme,
+        margin: usize,
+        outer_width: usize,
+        left: []const u8,
+        right: []const u8,
+        label: []const u8,
+        label_color: u8,
+    ) !void {
+        const inner_width = outer_width -| 2;
+        const clipped_label = if (label.len > inner_width) label[label.len - inner_width ..] else label;
+        const fill_count = inner_width - clipped_label.len;
+
+        try self.appendRepeat(" ", margin);
+        try self.setColor(theme.note);
+        try self.render_buf.appendSlice(self.gpa, left);
+        try self.appendRepeat("─", fill_count);
+        if (clipped_label.len != 0) {
+            try self.setColor(label_color);
+            try self.render_buf.appendSlice(self.gpa, clipped_label);
+            try self.setColor(theme.note);
         }
+        try self.render_buf.appendSlice(self.gpa, right);
         try self.resetColor();
         try self.newLine();
     }
 
-    fn renderFooter(self: *App, theme: Theme) !void {
+    fn renderPanelRow(self: *App, theme: Theme, margin: usize, width: usize, text: []const u8) !void {
+        const visible_len = minUsize(text.len, width);
+        const padding = width - visible_len;
+
+        try self.appendRepeat(" ", margin);
+        try self.setColor(theme.note);
+        try self.render_buf.appendSlice(self.gpa, "│ ");
+        try self.resetColor();
+        if (visible_len != 0) try self.appendClipped(text, width);
+        try self.appendRepeat(" ", padding);
+        try self.setColor(theme.note);
+        try self.render_buf.appendSlice(self.gpa, " │");
+        try self.resetColor();
+        try self.newLine();
+    }
+
+    fn renderInfoRow(self: *App, theme: Theme) !void {
+        try self.appendRepeat(" ", 1);
         if (self.search) |search| {
             const match_state = if (search.query.items.len == 0)
                 "type to search history"
@@ -1375,18 +1522,19 @@ const App = struct {
             var footer: [512]u8 = undefined;
             const line = try std.fmt.bufPrint(
                 &footer,
-                "history search: {s} | {s} | enter accept  esc cancel  ctrl-r older  ctrl-s newer",
+                "history search: {s} [{s}]",
                 .{ search.query.items, match_state },
             );
             try self.setColor(theme.note);
-            try self.appendClipped(line, self.size.cols);
+            try self.appendClipped(line, self.size.cols -| 1);
             try self.resetColor();
             try self.clearLine();
             return;
         }
 
+        const info = if (self.notice.items.len != 0) self.notice.items else "? for shortcuts";
         try self.setColor(theme.note);
-        try self.appendClipped(self.notice.items, self.size.cols);
+        try self.appendClipped(info, self.size.cols -| 1);
         try self.resetColor();
         try self.clearLine();
     }
@@ -1396,16 +1544,18 @@ const App = struct {
         errdefer lines.deinit(self.gpa);
 
         if (self.messages.items.len == 0) {
-            try lines.append(self.gpa, .{
-                .role = .note,
-                .slice = "No transcript yet. Draft below and press enter to send a turn.",
-                .first = true,
-                .active = false,
-            });
             return lines;
         }
 
         for (self.messages.items, 0..) |message, msg_index| {
+            if (msg_index != 0) {
+                try lines.append(self.gpa, .{
+                    .role = .note,
+                    .slice = "",
+                    .first = false,
+                    .active = false,
+                });
+            }
             var wrapped = try wrapLines(self.gpa, message.text.items, width);
             defer wrapped.deinit(self.gpa);
 
@@ -1428,6 +1578,13 @@ const App = struct {
 
     fn resetColor(self: *App) !void {
         try self.render_buf.appendSlice(self.gpa, "\x1b[0m");
+    }
+
+    fn appendRepeat(self: *App, text: []const u8, count: usize) !void {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            try self.render_buf.appendSlice(self.gpa, text);
+        }
     }
 
     fn appendClipped(self: *App, text: []const u8, width: usize) !void {
@@ -1506,6 +1663,67 @@ fn onStreamTextDelta(context: ?*anyopaque, delta: []const u8) anyerror!void {
     const text = try std.heap.smp_allocator.dupe(u8, delta);
     errdefer std.heap.smp_allocator.free(text);
     try worker_queue.push(.{ .text_delta = text });
+}
+
+fn buildLocationLabel(
+    gpa: Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+) !?[]u8 {
+    const pwd = environ_map.get("PWD") orelse return null;
+    const home = environ_map.get("HOME");
+    const display_path = try abbreviateHomeAlloc(gpa, pwd, home);
+    errdefer gpa.free(display_path);
+    const branch = try readGitBranchName(gpa, io);
+    defer if (branch) |name| gpa.free(name);
+
+    if (branch) |name| {
+        defer gpa.free(display_path);
+        return @as(?[]u8, try std.fmt.allocPrint(gpa, "{s} ({s})", .{ display_path, name }));
+    }
+    return @as(?[]u8, display_path);
+}
+
+fn abbreviateHomeAlloc(gpa: Allocator, path: []const u8, home: ?[]const u8) ![]u8 {
+    const prefix = home orelse return gpa.dupe(u8, path);
+    if (!std.mem.startsWith(u8, path, prefix)) return gpa.dupe(u8, path);
+    if (path.len != prefix.len and path[prefix.len] != '/') return gpa.dupe(u8, path);
+    if (path.len == prefix.len) return gpa.dupe(u8, "~");
+    return std.fmt.allocPrint(gpa, "~{s}", .{path[prefix.len..]});
+}
+
+fn readGitBranchName(gpa: Allocator, io: std.Io) !?[]u8 {
+    const head = readGitHeadAlloc(gpa, io) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer gpa.free(head);
+
+    const trimmed = std.mem.trim(u8, head, " \r\n\t");
+    if (std.mem.startsWith(u8, trimmed, "ref:")) {
+        const ref = std.mem.trim(u8, trimmed[4..], " \t");
+        const name = if (std.mem.lastIndexOfScalar(u8, ref, '/')) |idx| ref[idx + 1 ..] else ref;
+        return @as(?[]u8, try gpa.dupe(u8, name));
+    }
+
+    const short_len = minUsize(trimmed.len, 7);
+    return @as(?[]u8, try gpa.dupe(u8, trimmed[0..short_len]));
+}
+
+fn readGitHeadAlloc(gpa: Allocator, io: std.Io) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, ".git/HEAD", gpa, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const dot_git = try std.Io.Dir.cwd().readFileAlloc(io, ".git", gpa, .limited(4096));
+            defer gpa.free(dot_git);
+            const trimmed = std.mem.trim(u8, dot_git, " \r\n\t");
+            if (!std.mem.startsWith(u8, trimmed, "gitdir:")) return error.FileNotFound;
+            const gitdir = std.mem.trim(u8, trimmed[7..], " \t");
+            const head_path = try std.fmt.allocPrint(gpa, "{s}/HEAD", .{gitdir});
+            defer gpa.free(head_path);
+            break :blk try std.Io.Dir.cwd().readFileAlloc(io, head_path, gpa, .limited(4096));
+        },
+        else => return err,
+    };
 }
 
 fn readTerminalSize() !Size {
