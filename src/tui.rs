@@ -13,9 +13,46 @@ use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::openai::{self, Input, InputItem, ResponsesRequest};
+
+const DEFAULT_COMPOSE_HEIGHT: usize = 4;
+
+const MODEL_ALIASES: [ModelAlias; 5] = [
+    ModelAlias {
+        name: "latest",
+        model: "gpt-5.5",
+    },
+    ModelAlias {
+        name: "full",
+        model: "gpt-5.4",
+    },
+    ModelAlias {
+        name: "mini",
+        model: "gpt-5.4-mini",
+    },
+    ModelAlias {
+        name: "nano",
+        model: "gpt-5.4-nano",
+    },
+    ModelAlias {
+        name: "default",
+        model: openai::DEFAULT_MODEL,
+    },
+];
+
+#[derive(Clone, Copy)]
+struct ModelAlias {
+    name: &'static str,
+    model: &'static str,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TuiConfig {
+    model: String,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -37,7 +74,7 @@ const THEMES: [Theme; 4] = [
         name: "amp",
         header: 255,
         accent: 43,
-        user: 250,
+        user: 39,
         agent: 255,
         note: 245,
     },
@@ -45,7 +82,7 @@ const THEMES: [Theme; 4] = [
         name: "oxide",
         header: 39,
         accent: 44,
-        user: 214,
+        user: 39,
         agent: 81,
         note: 244,
     },
@@ -53,7 +90,7 @@ const THEMES: [Theme; 4] = [
         name: "ember",
         header: 202,
         accent: 208,
-        user: 220,
+        user: 39,
         agent: 79,
         note: 244,
     },
@@ -61,7 +98,7 @@ const THEMES: [Theme; 4] = [
         name: "lagoon",
         header: 45,
         accent: 51,
-        user: 215,
+        user: 39,
         agent: 86,
         note: 244,
     },
@@ -95,12 +132,19 @@ impl ContextItem {
 
 struct Job {
     prompt: String,
+    model: String,
     target_message: usize,
 }
 
 struct ActiveRequest {
     prompt: String,
+    model: String,
     target_message: usize,
+}
+
+struct WorkerRequest {
+    model: String,
+    input_items: Vec<InputItem>,
 }
 
 struct TurnCompletion {
@@ -135,16 +179,32 @@ struct TranscriptLine {
     active: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptStyle {
+    prefix: &'static str,
+    color: u8,
+    italic: bool,
+    bold: bool,
+}
+
 #[derive(Default)]
 struct InputOutcome {
     dirty: bool,
     quit: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum CommandOutcome {
     NotCommand,
     Handled,
     Rejected,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ModelArg {
+    Empty,
+    Invalid,
+    Selected(String),
 }
 
 enum Key {
@@ -219,6 +279,8 @@ struct App {
     theme_index: usize,
     spinner: usize,
     location_label: Option<String>,
+    current_model: String,
+    config_path: Option<PathBuf>,
     messages: Vec<Message>,
     context: Vec<ContextItem>,
     queue: VecDeque<Job>,
@@ -236,6 +298,8 @@ impl App {
         let client = openai::Client::from_env()?;
         let size = read_terminal_size()?;
         let location_label = build_location_label()?;
+        let config_path = default_config_path();
+        let current_model = startup_model(config_path.as_deref());
         let (worker_tx, worker_rx) = mpsc::channel();
 
         let mut app = Self {
@@ -250,6 +314,8 @@ impl App {
             theme_index: 0,
             spinner: 0,
             location_label,
+            current_model,
+            config_path,
             messages: Vec::new(),
             context: Vec::new(),
             queue: VecDeque::new(),
@@ -860,7 +926,7 @@ impl App {
 
         let body = trim_left_spaces(&line[1..]);
         if body.is_empty() {
-            self.set_notice("commands: /help /clear /remix /theme");
+            self.set_notice("commands: /help /clear /remix /theme /model");
             return Ok(CommandOutcome::Handled);
         }
 
@@ -914,9 +980,55 @@ impl App {
             self.set_notice(format!("unknown theme: {}", arg));
             return Ok(CommandOutcome::Rejected);
         }
+        if name.eq_ignore_ascii_case("model") {
+            return self.handle_model_command(arg);
+        }
 
         self.set_notice(format!("unknown command: /{}. try /help", name));
         Ok(CommandOutcome::Rejected)
+    }
+
+    fn handle_model_command(&mut self, arg: &str) -> Result<CommandOutcome> {
+        match parse_model_arg(arg) {
+            ModelArg::Empty => {
+                self.show_model_note();
+                Ok(CommandOutcome::Handled)
+            }
+            ModelArg::Invalid => {
+                self.set_notice("model must be a single token");
+                Ok(CommandOutcome::Rejected)
+            }
+            ModelArg::Selected(model) => {
+                self.current_model = model.clone();
+                match self.save_current_model() {
+                    Ok(()) => self.set_notice(format!("model switched to {}", model)),
+                    Err(err) => self.set_notice(format!(
+                        "model switched to {} (persistence failed: {})",
+                        model, err
+                    )),
+                }
+                Ok(CommandOutcome::Handled)
+            }
+        }
+    }
+
+    fn save_current_model(&self) -> Result<()> {
+        let Some(path) = &self.config_path else {
+            anyhow::bail!("no config path");
+        };
+        save_tui_config(path, &self.current_model)
+    }
+
+    fn show_model_note(&mut self) {
+        self.append_note(&format!(
+            "Model\n\
+             current: {}\n\n\
+             Aliases\n\
+             {}\n\n\
+             Custom single-token model IDs are passed through to the Responses API.",
+            self.current_model,
+            format_model_aliases()
+        ));
     }
 
     fn show_help_note(&mut self) {
@@ -926,7 +1038,7 @@ impl App {
              Up/Down move through wrapped draft lines and fall back to history at the edges. Ctrl-P and Ctrl-N walk history directly.\n\
              Ctrl-R searches history. Ctrl-C quits.\n\n\
              Commands\n\
-             /help /clear /remix /theme [amp|oxide|ember|lagoon|next]",
+             /help /clear /remix /theme [amp|oxide|ember|lagoon|next] /model [alias|id]",
         );
     }
 
@@ -983,6 +1095,7 @@ impl App {
 
         let job = Job {
             prompt,
+            model: self.current_model.clone(),
             target_message: self.messages.len() - 1,
         };
 
@@ -1020,11 +1133,16 @@ impl App {
         let request_items = self.build_request_items(&job.prompt);
         let client = self.client.clone();
         let tx = self.worker_tx.clone();
+        let worker_request = WorkerRequest {
+            model: job.model.clone(),
+            input_items: request_items,
+        };
 
-        thread::spawn(move || request_worker_main(client, tx, request_items));
+        thread::spawn(move || request_worker_main(client, tx, worker_request));
 
         self.active_request = Some(ActiveRequest {
             prompt: job.prompt,
+            model: job.model,
             target_message: job.target_message,
         });
         self.spinner = self.spinner.wrapping_add(1);
@@ -1149,7 +1267,7 @@ impl App {
 
         let info_height = 1usize;
         let max_compose_height = max_usize(self.size.rows.saturating_sub(info_height + 2), 1);
-        let compose_height = min_usize(max_usize(draft_lines.len(), 1), max_compose_height);
+        let compose_height = compose_height_for(draft_lines.len(), max_compose_height);
         let compose_outer_height = compose_height + 2;
         let transcript_height = self
             .size
@@ -1191,16 +1309,14 @@ impl App {
             }
         }
 
-        let top_label = if self.active_request.is_some() {
+        let top_label = if let Some(request) = &self.active_request {
             format!(
                 "{} streaming {}",
-                openai::DEFAULT_MODEL,
+                request.model,
                 spinner_char(self.spinner) as char
             )
-        } else if !self.queue.is_empty() {
-            format!("{} {} queued", openai::DEFAULT_MODEL, self.queue.len())
         } else {
-            openai::DEFAULT_MODEL.to_owned()
+            self.current_model.clone()
         };
         self.render_panel_border(
             theme,
@@ -1374,15 +1490,7 @@ impl App {
         margin: usize,
         width: usize,
     ) {
-        let prefix = match line.role {
-            Role::User if line.first => "› ",
-            _ => "  ",
-        };
-        let color = match line.role {
-            Role::User => theme.user,
-            Role::Agent => theme.agent,
-            Role::Note => theme.note,
-        };
+        let style = transcript_style(theme, line.role, line.first, line.active);
 
         self.append_repeat(" ", margin);
         if line.text.is_empty() {
@@ -1390,13 +1498,14 @@ impl App {
             return;
         }
 
-        self.set_color(theme.note);
-        self.render_buf.push_str(prefix);
-        self.reset_color();
-        self.set_color(color);
-        if line.active && line.first {
+        self.set_color(style.color);
+        if style.italic {
+            self.render_buf.push_str("\x1b[3m");
+        }
+        if style.bold {
             self.render_buf.push_str("\x1b[1m");
         }
+        self.render_buf.push_str(style.prefix);
         self.append_clipped(&line.text, width);
         self.reset_color();
         self.new_line();
@@ -1561,15 +1670,11 @@ pub fn run(opts: Options) -> Result<()> {
     app.run()
 }
 
-fn request_worker_main(
-    client: openai::Client,
-    tx: Sender<WorkerEvent>,
-    request_items: Vec<InputItem>,
-) {
+fn request_worker_main(client: openai::Client, tx: Sender<WorkerEvent>, request: WorkerRequest) {
     let result = (|| -> Result<()> {
         let delta_tx = tx.clone();
         let response = client.create_response_streaming(
-            ResponsesRequest::init(openai::DEFAULT_MODEL, Input::items(request_items))
+            ResponsesRequest::init(request.model, Input::items(request.input_items))
                 .with_store(false),
             move |delta| {
                 let _ = delta_tx.send(WorkerEvent::TextDelta(delta.to_owned()));
@@ -1590,6 +1695,93 @@ fn request_worker_main(
     if let Err(err) = result {
         let _ = tx.send(WorkerEvent::Failed(err.to_string()));
     }
+}
+
+fn default_config_path() -> Option<PathBuf> {
+    if let Some(dir) = non_empty_env("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(dir).join("agentz").join("config.json"));
+    }
+    non_empty_env("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("agentz")
+            .join("config.json")
+    })
+}
+
+fn startup_model(config_path: Option<&Path>) -> String {
+    config_path
+        .and_then(load_config_model)
+        .or_else(env_model)
+        .unwrap_or_else(|| openai::DEFAULT_MODEL.to_owned())
+}
+
+fn load_config_model(path: &Path) -> Option<String> {
+    let body = fs::read_to_string(path).ok()?;
+    let config = serde_json::from_str::<TuiConfig>(&body).ok()?;
+    normalize_model_value(&config.model)
+}
+
+fn save_tui_config(path: &Path, model: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create agentz config directory")?;
+    }
+    let mut body = serde_json::to_string_pretty(&TuiConfig {
+        model: model.to_owned(),
+    })
+    .context("failed to serialize agentz config")?;
+    body.push('\n');
+    fs::write(path, body).context("failed to write agentz config")
+}
+
+fn env_model() -> Option<String> {
+    non_empty_env("OPENAI_MODEL").and_then(|value| normalize_model_value(&value))
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_model_arg(arg: &str) -> ModelArg {
+    let mut words = arg.split_whitespace();
+    let Some(first) = words.next() else {
+        return ModelArg::Empty;
+    };
+    if words.next().is_some() {
+        return ModelArg::Invalid;
+    }
+    normalize_model_value(first)
+        .map(ModelArg::Selected)
+        .unwrap_or(ModelArg::Invalid)
+}
+
+fn normalize_model_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    Some(resolve_model_token(trimmed))
+}
+
+fn resolve_model_token(token: &str) -> String {
+    MODEL_ALIASES
+        .iter()
+        .find(|alias| token.eq_ignore_ascii_case(alias.name))
+        .map_or_else(|| token.to_owned(), |alias| alias.model.to_owned())
+}
+
+fn format_model_aliases() -> String {
+    let mut lines = String::new();
+    for (index, alias) in MODEL_ALIASES.iter().enumerate() {
+        if index != 0 {
+            lines.push('\n');
+        }
+        let _ = write!(lines, "{} -> {}", alias.name, alias.model);
+    }
+    lines
 }
 
 fn build_location_label() -> Result<Option<String>> {
@@ -1987,6 +2179,36 @@ fn tail_clipped(text: &str, max_bytes: usize) -> &str {
     &text[start..]
 }
 
+fn compose_height_for(draft_line_count: usize, max_compose_height: usize) -> usize {
+    min_usize(
+        max_usize(draft_line_count, DEFAULT_COMPOSE_HEIGHT),
+        max_compose_height,
+    )
+}
+
+fn transcript_style(theme: Theme, role: Role, first: bool, active: bool) -> TranscriptStyle {
+    match role {
+        Role::User => TranscriptStyle {
+            prefix: "| ",
+            color: theme.user,
+            italic: true,
+            bold: false,
+        },
+        Role::Agent => TranscriptStyle {
+            prefix: "  ",
+            color: theme.agent,
+            italic: false,
+            bold: active && first,
+        },
+        Role::Note => TranscriptStyle {
+            prefix: "  ",
+            color: theme.note,
+            italic: false,
+            bold: false,
+        },
+    }
+}
+
 fn dirty_only() -> InputOutcome {
     InputOutcome {
         dirty: true,
@@ -1997,6 +2219,51 @@ fn dirty_only() -> InputOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_config_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        env::temp_dir()
+            .join(format!(
+                "agentz-test-{}-{}-{}",
+                std::process::id(),
+                label,
+                nanos
+            ))
+            .join("config.json")
+    }
+
+    fn test_app(config_path: Option<PathBuf>) -> App {
+        let (worker_tx, worker_rx) = mpsc::channel();
+        App {
+            client: openai::Client::init("sk-test").expect("test client"),
+            size: Size { cols: 80, rows: 24 },
+            render_buf: String::new(),
+            notice: String::new(),
+            draft: String::new(),
+            kill_buffer: String::new(),
+            cursor: 0,
+            scroll_from_bottom: 0,
+            theme_index: 0,
+            spinner: 0,
+            location_label: None,
+            current_model: openai::DEFAULT_MODEL.to_owned(),
+            config_path,
+            messages: Vec::new(),
+            context: Vec::new(),
+            queue: VecDeque::new(),
+            history: Vec::new(),
+            history_index: None,
+            history_draft: None,
+            search: None,
+            worker_tx,
+            worker_rx,
+            active_request: None,
+        }
+    }
 
     #[test]
     fn wrap_lines_keeps_blank_rows_and_wraps_at_spaces() {
@@ -2012,5 +2279,140 @@ mod tests {
     fn contains_ignore_case_matches_ascii_without_regard_to_case() {
         assert!(contains_ignore_case("Alpha Beta", "beta"));
         assert!(!contains_ignore_case("Alpha Beta", "gamma"));
+    }
+
+    #[test]
+    fn transcript_style_renders_user_lines_as_blue_italic_pipe_blocks() {
+        let style = transcript_style(THEMES[0], Role::User, true, false);
+        assert_eq!(style.prefix, "| ");
+        assert_eq!(style.color, 39);
+        assert!(style.italic);
+        assert!(!style.bold);
+    }
+
+    #[test]
+    fn compose_height_uses_amp_sized_default_box() {
+        assert_eq!(compose_height_for(1, 20), DEFAULT_COMPOSE_HEIGHT);
+        assert_eq!(compose_height_for(6, 20), 6);
+        assert_eq!(compose_height_for(1, 2), 2);
+    }
+
+    #[test]
+    fn model_arg_resolves_aliases_defaults_and_custom_ids() {
+        assert_eq!(
+            parse_model_arg("latest"),
+            ModelArg::Selected("gpt-5.5".to_owned())
+        );
+        assert_eq!(
+            parse_model_arg("full"),
+            ModelArg::Selected("gpt-5.4".to_owned())
+        );
+        assert_eq!(
+            parse_model_arg("mini"),
+            ModelArg::Selected("gpt-5.4-mini".to_owned())
+        );
+        assert_eq!(
+            parse_model_arg("nano"),
+            ModelArg::Selected("gpt-5.4-nano".to_owned())
+        );
+        assert_eq!(
+            parse_model_arg("default"),
+            ModelArg::Selected(openai::DEFAULT_MODEL.to_owned())
+        );
+        assert_eq!(
+            parse_model_arg("gpt-custom-2026-04-24"),
+            ModelArg::Selected("gpt-custom-2026-04-24".to_owned())
+        );
+    }
+
+    #[test]
+    fn model_arg_handles_empty_and_invalid_input() {
+        assert_eq!(parse_model_arg(""), ModelArg::Empty);
+        assert_eq!(parse_model_arg(" \t "), ModelArg::Empty);
+        assert_eq!(parse_model_arg("mini extra"), ModelArg::Invalid);
+    }
+
+    #[test]
+    fn config_load_save_round_trips_and_falls_back_for_bad_files() {
+        let path = test_config_path("config");
+        assert_eq!(load_config_model(&path), None);
+
+        save_tui_config(&path, "gpt-5.4-mini").expect("save config");
+        assert_eq!(load_config_model(&path), Some("gpt-5.4-mini".to_owned()));
+
+        fs::write(&path, r#"{"model":"mini"}"#).expect("write alias config");
+        assert_eq!(load_config_model(&path), Some("gpt-5.4-mini".to_owned()));
+
+        fs::write(&path, "{").expect("write malformed config");
+        assert_eq!(load_config_model(&path), None);
+
+        fs::write(&path, r#"{"model":"bad model"}"#).expect("write invalid config");
+        assert_eq!(load_config_model(&path), None);
+
+        let _ = fs::remove_dir_all(path.parent().expect("test dir"));
+    }
+
+    #[test]
+    fn model_command_without_args_lists_current_model_and_aliases() {
+        let mut app = test_app(Some(test_config_path("model-list")));
+        let outcome = app
+            .handle_slash_command("/model", false)
+            .expect("model command");
+
+        assert_eq!(outcome, CommandOutcome::Handled);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].role, Role::Note);
+        assert!(app.messages[0].text.contains(openai::DEFAULT_MODEL));
+        assert!(app.messages[0].text.contains("latest -> gpt-5.5"));
+        assert!(app.messages[0].text.contains("default -> "));
+    }
+
+    #[test]
+    fn model_command_updates_current_model_and_persists() {
+        let path = test_config_path("model-update");
+        let mut app = test_app(Some(path.clone()));
+        let outcome = app
+            .handle_slash_command("/model mini", false)
+            .expect("model command");
+
+        assert_eq!(outcome, CommandOutcome::Handled);
+        assert_eq!(app.current_model, "gpt-5.4-mini");
+        assert!(app.notice.contains("model switched to gpt-5.4-mini"));
+        assert_eq!(load_config_model(&path), Some("gpt-5.4-mini".to_owned()));
+
+        let _ = fs::remove_dir_all(path.parent().expect("test dir"));
+    }
+
+    #[test]
+    fn model_command_keeps_selection_when_persistence_fails() {
+        let mut app = test_app(None);
+        let outcome = app
+            .handle_slash_command("/model nano", false)
+            .expect("model command");
+
+        assert_eq!(outcome, CommandOutcome::Handled);
+        assert_eq!(app.current_model, "gpt-5.4-nano");
+        assert!(app.notice.contains("persistence failed"));
+    }
+
+    #[test]
+    fn queued_prompts_capture_the_selected_model_at_enqueue_time() {
+        let mut app = test_app(Some(test_config_path("queue-model")));
+        app.active_request = Some(ActiveRequest {
+            prompt: "active".to_owned(),
+            model: "gpt-active".to_owned(),
+            target_message: 0,
+        });
+        app.current_model = "gpt-next".to_owned();
+
+        app.enqueue_prompt("queued".to_owned(), true)
+            .expect("enqueue prompt");
+
+        assert_eq!(
+            app.active_request.as_ref().expect("active request").model,
+            "gpt-active"
+        );
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue[0].model, "gpt-next");
     }
 }
