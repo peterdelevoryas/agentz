@@ -19,6 +19,42 @@ use serde_json::Value;
 use crate::openai::{self, Input, InputItem, ResponsesRequest};
 
 const DEFAULT_COMPOSE_HEIGHT: usize = 4;
+const COMMAND_PALETTE_MAX_ITEMS: usize = 8;
+
+const SLASH_COMMANDS: [SlashCommand; 5] = [
+    SlashCommand {
+        name: "help",
+        args: "",
+        summary: "Show shortcuts and commands",
+    },
+    SlashCommand {
+        name: "clear",
+        args: "",
+        summary: "Clear the transcript",
+    },
+    SlashCommand {
+        name: "remix",
+        args: "",
+        summary: "Replay the last user prompt",
+    },
+    SlashCommand {
+        name: "theme",
+        args: "[amp|oxide|ember|lagoon|next]",
+        summary: "Switch the color theme",
+    },
+    SlashCommand {
+        name: "model",
+        args: "[alias|id]",
+        summary: "Switch the model for future prompts",
+    },
+];
+
+#[derive(Clone, Copy)]
+struct SlashCommand {
+    name: &'static str,
+    args: &'static str,
+    summary: &'static str,
+}
 
 const MODEL_ALIASES: [ModelAlias; 5] = [
     ModelAlias {
@@ -187,6 +223,12 @@ struct TranscriptStyle {
     bold: bool,
 }
 
+struct CommandPaletteState {
+    query: String,
+    matches: Vec<usize>,
+    selected: usize,
+}
+
 #[derive(Default)]
 struct InputOutcome {
     dirty: bool,
@@ -281,6 +323,7 @@ struct App {
     location_label: Option<String>,
     current_model: String,
     config_path: Option<PathBuf>,
+    command_palette_index: usize,
     messages: Vec<Message>,
     context: Vec<ContextItem>,
     queue: VecDeque<Job>,
@@ -316,6 +359,7 @@ impl App {
             location_label,
             current_model,
             config_path,
+            command_palette_index: 0,
             messages: Vec::new(),
             context: Vec::new(),
             queue: VecDeque::new(),
@@ -426,6 +470,9 @@ impl App {
                 dirty_only()
             }
             Key::Up => {
+                if self.move_command_palette_selection(-1) {
+                    return Ok(dirty_only());
+                }
                 if self.move_cursor_vertical(-1)? || self.navigate_history_older()? {
                     dirty_only()
                 } else {
@@ -433,6 +480,9 @@ impl App {
                 }
             }
             Key::Down => {
+                if self.move_command_palette_selection(1) {
+                    return Ok(dirty_only());
+                }
                 if self.move_cursor_vertical(1)? || self.navigate_history_newer()? {
                     dirty_only()
                 } else {
@@ -508,7 +558,9 @@ impl App {
                 dirty_only()
             }
             Key::Tab => {
-                self.submit_draft(true)?;
+                if !self.complete_slash_command() {
+                    self.submit_draft(true)?;
+                }
                 dirty_only()
             }
             Key::Enter => {
@@ -581,12 +633,14 @@ impl App {
     fn insert_draft_slice(&mut self, bytes: &str) {
         self.draft.insert_str(self.cursor, bytes);
         self.cursor += bytes.len();
+        self.command_palette_index = 0;
     }
 
     fn set_draft_text(&mut self, text: &str) {
         self.draft.clear();
         self.draft.push_str(text);
         self.cursor = self.draft.len();
+        self.command_palette_index = 0;
     }
 
     fn set_kill_buffer(&mut self, text: &str) {
@@ -913,6 +967,68 @@ impl App {
             return;
         }
         self.history.push(text.to_owned());
+    }
+
+    fn command_palette_state(&self) -> Option<CommandPaletteState> {
+        if self.search.is_some() {
+            return None;
+        }
+
+        let query = slash_command_query(&self.draft, self.cursor)?;
+        let matches = slash_command_matches(query);
+        let selected = if matches.is_empty() {
+            0
+        } else {
+            min_usize(self.command_palette_index, matches.len() - 1)
+        };
+
+        Some(CommandPaletteState {
+            query: query.to_owned(),
+            matches,
+            selected,
+        })
+    }
+
+    fn move_command_palette_selection(&mut self, delta: isize) -> bool {
+        let Some(state) = self.command_palette_state() else {
+            return false;
+        };
+        if state.matches.is_empty() {
+            return true;
+        }
+
+        let len = state.matches.len();
+        self.command_palette_index = if delta < 0 {
+            if state.selected == 0 {
+                len - 1
+            } else {
+                state.selected - 1
+            }
+        } else {
+            (state.selected + 1) % len
+        };
+        true
+    }
+
+    fn complete_slash_command(&mut self) -> bool {
+        let Some(state) = self.command_palette_state() else {
+            return false;
+        };
+        let Some(command_index) = state.matches.get(state.selected) else {
+            return true;
+        };
+
+        let command = SLASH_COMMANDS[*command_index];
+        let completion = if command.args.is_empty() {
+            format!("/{}", command.name)
+        } else {
+            format!("/{} ", command.name)
+        };
+        let token_end = slash_command_token_end(&self.draft);
+        self.draft.replace_range(0..token_end, &completion);
+        self.cursor = completion.len();
+        self.command_palette_index = 0;
+        true
     }
 
     fn handle_slash_command(
@@ -1261,6 +1377,7 @@ impl App {
         let compose_width = max_usize(box_outer_width.saturating_sub(4), 1);
         let transcript_width =
             max_usize(self.size.cols.saturating_sub(transcript_margin * 2 + 2), 1);
+        let command_palette = self.command_palette_state();
 
         let draft_lines = wrap_lines(&self.draft, compose_width);
         let draft_cursor = cursor_visual(&draft_lines, self.cursor);
@@ -1355,6 +1472,10 @@ impl App {
         );
         let _ = screen_row;
         self.render_info_row(theme);
+
+        if let Some(palette) = &command_palette {
+            self.render_command_palette(theme, palette, compose_start_row);
+        }
 
         let visible_cursor_line = draft_cursor.line.saturating_sub(compose_visible_start);
         let cursor_row = compose_start_row + visible_cursor_line;
@@ -1511,6 +1632,96 @@ impl App {
         self.new_line();
     }
 
+    fn render_command_palette(
+        &mut self,
+        theme: Theme,
+        state: &CommandPaletteState,
+        compose_start_row: usize,
+    ) {
+        let row_count = min_usize(max_usize(state.matches.len(), 1), COMMAND_PALETTE_MAX_ITEMS);
+        let height = row_count + 3;
+        let max_width = max_usize(self.size.cols.saturating_sub(4), 1);
+        let width = min_usize(max_usize(self.size.cols * 3 / 5, 48), max_width);
+        let col = self.size.cols.saturating_sub(width) / 2 + 1;
+        let row = if compose_start_row > height + 1 {
+            compose_start_row - height - 1
+        } else {
+            1
+        };
+
+        self.render_floating_border(
+            theme,
+            row,
+            col,
+            width,
+            "╭",
+            "╮",
+            " Command Palette ",
+            theme.accent,
+        );
+        self.render_floating_row(
+            theme,
+            row + 1,
+            col,
+            width,
+            &format!("> /{}", state.query),
+            theme.agent,
+            None,
+            false,
+        );
+
+        if state.matches.is_empty() {
+            self.render_floating_row(
+                theme,
+                row + 2,
+                col,
+                width,
+                "  no matching commands",
+                theme.note,
+                None,
+                false,
+            );
+        } else {
+            let visible_start = if state.selected >= COMMAND_PALETTE_MAX_ITEMS {
+                state.selected + 1 - COMMAND_PALETTE_MAX_ITEMS
+            } else {
+                0
+            };
+            let visible_end = min_usize(
+                state.matches.len(),
+                visible_start + COMMAND_PALETTE_MAX_ITEMS,
+            );
+
+            for (visible_row, match_index) in
+                state.matches[visible_start..visible_end].iter().enumerate()
+            {
+                let command = SLASH_COMMANDS[*match_index];
+                let selected = visible_start + visible_row == state.selected;
+                self.render_floating_row(
+                    theme,
+                    row + 2 + visible_row,
+                    col,
+                    width,
+                    &format_slash_command_row(command),
+                    if selected { 16 } else { theme.agent },
+                    selected.then_some(theme.accent),
+                    selected,
+                );
+            }
+        }
+
+        self.render_floating_border(
+            theme,
+            row + height - 1,
+            col,
+            width,
+            "╰",
+            "╯",
+            "",
+            theme.note,
+        );
+    }
+
     fn render_panel_border(
         &mut self,
         theme: Theme,
@@ -1537,6 +1748,70 @@ impl App {
         self.render_buf.push_str(right);
         self.reset_color();
         self.new_line();
+    }
+
+    fn render_floating_border(
+        &mut self,
+        theme: Theme,
+        row: usize,
+        col: usize,
+        width: usize,
+        left: &str,
+        right: &str,
+        label: &str,
+        label_color: u8,
+    ) {
+        let inner_width = width.saturating_sub(2);
+        let clipped_label = clipped_prefix(label, inner_width);
+        let before = inner_width.saturating_sub(clipped_label.len()) / 2;
+        let after = inner_width.saturating_sub(before + clipped_label.len());
+
+        self.move_to(row, col);
+        self.set_color(theme.note);
+        self.render_buf.push_str(left);
+        self.append_repeat("─", before);
+        if !clipped_label.is_empty() {
+            self.set_color(label_color);
+            self.render_buf.push_str(clipped_label);
+            self.set_color(theme.note);
+        }
+        self.append_repeat("─", after);
+        self.render_buf.push_str(right);
+        self.reset_color();
+    }
+
+    fn render_floating_row(
+        &mut self,
+        theme: Theme,
+        row: usize,
+        col: usize,
+        width: usize,
+        text: &str,
+        text_color: u8,
+        background: Option<u8>,
+        bold: bool,
+    ) {
+        let inner_width = width.saturating_sub(2);
+        let visible = clipped_prefix(text, inner_width);
+        let padding = inner_width.saturating_sub(visible.len());
+
+        self.move_to(row, col);
+        self.set_color(theme.note);
+        self.render_buf.push_str("│");
+        self.reset_color();
+        if let Some(color) = background {
+            self.set_bg_color(color);
+        }
+        self.set_color(text_color);
+        if bold {
+            self.render_buf.push_str("\x1b[1m");
+        }
+        self.render_buf.push_str(visible);
+        self.append_repeat(" ", padding);
+        self.reset_color();
+        self.set_color(theme.note);
+        self.render_buf.push_str("│");
+        self.reset_color();
     }
 
     fn render_panel_row(&mut self, theme: Theme, margin: usize, width: usize, text: &str) {
@@ -1620,8 +1895,16 @@ impl App {
         let _ = write!(self.render_buf, "\x1b[38;5;{}m", color);
     }
 
+    fn set_bg_color(&mut self, color: u8) {
+        let _ = write!(self.render_buf, "\x1b[48;5;{}m", color);
+    }
+
     fn reset_color(&mut self) {
         self.render_buf.push_str("\x1b[0m");
+    }
+
+    fn move_to(&mut self, row: usize, col: usize) {
+        let _ = write!(self.render_buf, "\x1b[{};{}H", row, col);
     }
 
     fn append_repeat(&mut self, text: &str, count: usize) {
@@ -1782,6 +2065,71 @@ fn format_model_aliases() -> String {
         let _ = write!(lines, "{} -> {}", alias.name, alias.model);
     }
     lines
+}
+
+fn slash_command_query(draft: &str, cursor: usize) -> Option<&str> {
+    if !draft.starts_with('/') {
+        return None;
+    }
+    let cursor = min_usize(cursor, draft.len());
+    if cursor == 0 {
+        return None;
+    }
+
+    let before_cursor = &draft[1..cursor];
+    if before_cursor
+        .as_bytes()
+        .iter()
+        .any(|byte| is_whitespace_byte(*byte))
+    {
+        return None;
+    }
+    Some(before_cursor)
+}
+
+fn slash_command_token_end(draft: &str) -> usize {
+    draft
+        .as_bytes()
+        .iter()
+        .position(|byte| is_whitespace_byte(*byte))
+        .unwrap_or(draft.len())
+}
+
+fn slash_command_matches(query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..SLASH_COMMANDS.len()).collect();
+    }
+
+    let mut matches = SLASH_COMMANDS
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            starts_with_ignore_case(command.name, query).then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        matches = SLASH_COMMANDS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                (contains_ignore_case(command.name, query)
+                    || contains_ignore_case(command.summary, query))
+                .then_some(index)
+            })
+            .collect();
+    }
+
+    matches
+}
+
+fn format_slash_command_row(command: SlashCommand) -> String {
+    let command_text = if command.args.is_empty() {
+        format!("/{}", command.name)
+    } else {
+        format!("/{} {}", command.name, command.args)
+    };
+    format!("  {:<34} {}", command_text, command.summary)
 }
 
 fn build_location_label() -> Result<Option<String>> {
@@ -2128,6 +2476,20 @@ fn ascii_lower(byte: u8) -> u8 {
     byte.to_ascii_lowercase()
 }
 
+fn starts_with_ignore_case(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    for offset in 0..needle.len() {
+        if ascii_lower(haystack[offset]) != ascii_lower(needle[offset]) {
+            return false;
+        }
+    }
+    true
+}
+
 fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     let haystack = haystack.as_bytes();
     let needle = needle.as_bytes();
@@ -2252,6 +2614,7 @@ mod tests {
             location_label: None,
             current_model: openai::DEFAULT_MODEL.to_owned(),
             config_path,
+            command_palette_index: 0,
             messages: Vec::new(),
             context: Vec::new(),
             queue: VecDeque::new(),
@@ -2279,6 +2642,52 @@ mod tests {
     fn contains_ignore_case_matches_ascii_without_regard_to_case() {
         assert!(contains_ignore_case("Alpha Beta", "beta"));
         assert!(!contains_ignore_case("Alpha Beta", "gamma"));
+    }
+
+    #[test]
+    fn slash_command_query_only_tracks_the_command_token() {
+        assert_eq!(slash_command_query("/", 1), Some(""));
+        assert_eq!(slash_command_query("/mo", 3), Some("mo"));
+        assert_eq!(slash_command_query("hello /mo", 9), None);
+        assert_eq!(slash_command_query("/model mini", 11), None);
+    }
+
+    #[test]
+    fn slash_command_matches_filter_by_command_name_then_summary() {
+        let names = slash_command_matches("m")
+            .into_iter()
+            .map(|index| SLASH_COMMANDS[index].name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["model"]);
+
+        let names = slash_command_matches("transcript")
+            .into_iter()
+            .map(|index| SLASH_COMMANDS[index].name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["clear"]);
+    }
+
+    #[test]
+    fn tab_completes_the_selected_slash_command() {
+        let mut app = test_app(Some(test_config_path("palette-complete")));
+        app.set_draft_text("/mo");
+
+        assert!(app.complete_slash_command());
+
+        assert_eq!(app.draft, "/model ");
+        assert_eq!(app.cursor, app.draft.len());
+    }
+
+    #[test]
+    fn tab_completion_uses_palette_selection() {
+        let mut app = test_app(Some(test_config_path("palette-selected")));
+        app.set_draft_text("/");
+
+        assert!(app.move_command_palette_selection(1));
+        assert!(app.complete_slash_command());
+
+        assert_eq!(app.draft, "/clear");
+        assert_eq!(app.cursor, app.draft.len());
     }
 
     #[test]
